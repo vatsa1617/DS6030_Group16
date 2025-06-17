@@ -1,0 +1,234 @@
+---
+title:  |
+        | Disaster Relief Project
+        | Part One
+author: |
+        | Group 16
+        | Srivatsa Balasubramanyam 
+date: June 23, 2025
+output:
+  bookdown::html_document2:
+    number_sections: true
+    toc: false
+    extra_dependencies: ["float"]
+subtitle: |
+          | University of Virginia
+          | School of Data Science
+          | Statistical Learning
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, cache=TRUE, autodep=TRUE, fig.align="center")
+```
+
+### Load the required library
+
+```{r message=FALSE, warning=FALSE}
+rm(list=ls())
+library(tidymodels)
+library(tidyverse)
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+```
+
+```{r}
+#| cache: FALSE
+#| message: false
+library(doParallel)
+
+cl <- makePSOCKcluster(parallelly::availableCores(omit = 4))
+registerDoParallel(cl)
+```
+
+**Introduction**
+
+In the immediate aftermath of the January 12, 2010 earthquake in Haiti, nations worldwide responded to the Haitian government’s appeal for aid by pledging funds and dispatching rescue personnel. However, as rescue operations commenced, a critical challenge emerged: the destruction of communications infrastructure made it extremely difficult to determine where to direct emergency supplies and assistance.
+
+**Challenge: Locating Displaced Populations**
+
+With millions displaced and traditional communication channels inoperable, rescue workers needed an effective method to identify the locations of those most in need. It was observed that many displaced individuals were constructing makeshift shelters using blue tarps, which became a key visual indicator of temporary settlements
+
+A team from the Rochester Institute of Technology addressed this challenge by collecting high-resolution, geo-referenced aerial photographs over the affected areas. These images, while rich in detail, represented an enormous volume of data, making manual analysis infeasible given the urgency and scale of the crisis.
+
+**Solution: Statistical Modeling of Aerial Imagery**
+
+To overcome the limitations of manual image analysis, statistical modeling techniques were employed to automate the identification of makeshift shelters. The process involved:
+
+-   Using the color characteristics of blue tarps as the primary indicator of shelter locations.
+-   Extracting pixel-level data (Red, Green, Blue values) from the aerial images as predictor variables.
+-   Applying supervised learning algorithms to classify image regions as either containing blue tarps (shelters) or not.
+
+**Model Selection and Evaluation**
+
+Many statistical models will be considered for this task:
+
+Models without tuning parameters – Logistic Regression – LDA (Linear Discriminant Analysis) – QDA (Quadratic Discriminant Analysis)
+
+• Models with tuning parameters – KNN (K-nearest neighbor) – Penalized Logistic Regression (elastic net penalty) – Ensemble method: random forest (ranger) or boosting (XGBoost) – Support Vector Machines (SVM) ∗ linear kernel ∗ polynomial kernel ∗ radial basis function kernel
+
+#### Load the Haiti Dataset
+
+```{r message=FALSE, warning=FALSE}
+get_holdouts <- function(file) {
+  
+  infile <- read_lines(file,n_max = 20)
+  
+  col_row <- infile %>% 
+    data.frame() %>% 
+    mutate(text = gsub(';','',.)) %>% 
+    select(-.)%>% 
+    mutate(end = right(text,2) == 'B3',
+           row = row_number()) %>% 
+    filter(end==T) %>% 
+    select(row)
+  
+  f <- suppressWarnings(read_table(file,skip = col_row$row-1,n_max = 20,col_types = cols()))
+  
+  long_cols <- c('ID','X','Y','Map_X','Map_Y','Lat','Long','B1','B2','B3')
+  short_cols <- c('B1','B2','B3')
+  
+  if (ncol(f) > 4) {
+    final <- read_table(file,skip = col_row$row,col_names = long_cols,col_types = cols())
+  } else {
+    final <- read_table(file,skip = col_row$row,col_names = short_cols,col_types = cols())
+  }
+  
+}
+
+left <- function (x,n) substr(x,1,n)
+right <- function(x,n) substr(x,nchar(x)-n+1,nchar(x))
+
+training <- read_csv('DRF_Data/HaitiPixels.csv') %>% 
+  mutate(Class = factor(Class)) %>% 
+  mutate(Tarp = factor(ifelse(Class=='Blue Tarp','Tarp','Not Tarp'))) %>% 
+  mutate(Tarp = fct_relevel(Tarp,c('Tarp','Not Tarp')))
+
+holdout <- data.frame(path = list.files('DRF_Data/holdouts',recursive = T,pattern = '.txt',full.names = T)) %>% 
+  rowwise() %>% 
+  mutate(data = list(get_holdouts(path))) %>% 
+  ungroup()
+```
+
+```{r}
+str(training)
+str(holdout)
+
+```
+
+The dataset comprises nine files: one training set (63,241 observations) and eight holdout files. Each training observation corresponds to a pixel, with four variables: classification (Blue Tarp, Rooftop, Soil, Various Non-Tarp, Vegetation) and RGB values. A binary "Tarp"/"Not Tarp" column was added for focused analysis. The holdout set includes RGB values labeled as B1, B2, B3 and six coordinate columns. Initial exploration identified a duplicate file (orthovnir067_ROI_Blue_Tarps_data.txt), which was removed, resulting in a final holdout set exceeding 2,000,000 data points. Current efforts prioritize verifying RGB column correspondence across files to ensure data integrity for subsequent modeling.
+
+#### Check if any data is missing
+
+```{r}
+missing_count <- training %>%
+  summarise_all(~sum(is.na(.))) %>%
+  gather(key = "Variable", value = "Missing_Count") %>%
+  arrange(desc(Missing_Count))
+
+print(missing_count)
+```
+
+There is **No** missing data in any column in the given data set.
+
+#### The training data set
+
+```{r}
+summary(training)
+```
+
+### **Class Distribution indicates severe Imbalance in training dataset**
+
+-   **Blue Tarp**: 2,022 pixels (3.1%)
+
+-   **Non-Tarp Classes**: 63,219 pixels (96.9%)
+
+    -   Rooftop: 9,903 (15.2%)
+
+    -   Soil: 20,566 (31.5%)
+
+    -   Various Non-Tarp: 4,744 (7.3%)
+
+    -   Vegetation: 26,006 (39.8%)
+
+    **Key Issue**: Extreme class imbalance with tarps being only \~3% of data
+
+```{r}
+#| fig.width: 9
+#| fig.height: 4
+#| fig.cap: 'Classifications of the training set.'
+cols <- c('Blue Tarp' = 'blue','Rooftop' = 'darkgrey','Soil'='yellow','Various Non-Tarp' = 'darkred','Vegetation'='green')
+
+training %>% 
+  ggplot(aes(x=Tarp, fill = Class)) +
+  geom_bar(position = "stack")+
+  scale_fill_manual(values=cols)+
+  labs(title = "Classifications of the training set",
+       x = "Tarp Status")+
+  theme(plot.title = element_text(hjust = .5))
+```
+
+The chart clearly highlights the imbalance on different classes in the training data set.
+
+#### RGB Parameter analysis
+
+```{r}
+training_rgb <- training %>% 
+  select(Red,Green,Blue) %>% 
+  mutate(
+    RGB = rgb(Red, Green, Blue, maxColorValue = 255)
+  )
+```
+
+```{r}
+
+#| fig.width: 6
+#| fig.height: 3
+#| fig.cap: 'Histograms of RGB Values'
+
+df_long <- training_rgb %>%
+  select(Red,Green,Blue) %>% 
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Channel", values_to = "Value")
+
+# Create histograms for each channel
+ggplot(df_long, aes(x = Value, fill = Channel)) +
+  geom_histogram(binwidth = 5, alpha = 0.3, position = "identity") +
+  facet_wrap(~ Channel, scales = "free_y") +
+  labs(title = "Histograms of RGB Values", x = "Value", y = "Count") +
+  scale_fill_manual(values = c("blue", "green", "red")) +
+  theme_minimal()+
+  theme(plot.title = element_text(hjust = .5))
+```
+
+The RGB histogram analysis reveals a vegetation-heavy dataset with bimodal distributions across all channels, indicating diverse lighting conditions and surface types. Red values are heavily skewed low (typical of vegetated areas), while green and blue show distinct peaks. Overlapping distributions across all channels make simple RGB thresholding ineffective for blue tarp detection. Success will require band ratios, vegetation indices, and multi-band feature combinations rather than single-channel classification approaches.
+
+## The Holdout data set
+
+```{r}
+holdout_combo <- holdout %>% 
+  unnest(data) %>% 
+  na.omit()%>% 
+  mutate(b123 = rgb(B1,B2,B3,maxColorValue = 255),
+         b213 = rgb(B2,B1,B3,maxColorValue = 255),
+         b132 = rgb(B1,B3,B2,maxColorValue = 255),
+         b312 = rgb(B3,B1,B2,maxColorValue = 255),
+         b321 = rgb(B3,B2,B1,maxColorValue = 255),
+         b231 = rgb(B2,B3,B1,maxColorValue = 255)) %>% 
+  rename(lon=Long,lat=Lat) %>% 
+  select(path,lat,lon,B1,B2,B3,b123,b132,b213,b231,b321,b312) %>% 
+  nest(data = c(lat,lon,B1,B2,B3,b123,b132,b213,b231,b321,b312))
+
+all_holdout <- holdout_combo %>% 
+  select(data) %>% 
+  unnest(data) 
+```
+
+```{r}
+summary(all_holdout)
+```
+
+#### Exploratory Data Analysis on a Training Data Subset
+
+#### Exploratory Data Analysis on a Test Data Subset
+
+## Model Fitting, Tuning Parameter Selection, Evaluation
