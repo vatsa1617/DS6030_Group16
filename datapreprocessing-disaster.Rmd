@@ -1,0 +1,147 @@
+---
+title: "datapreprocessing-disaster"
+author: "Shriya Kuruba"
+date: "2025-06-17"
+output: pdf_document
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(readr)
+```
+
+```{r}
+haiti <- read_csv("https://gedeck.github.io/DS-6030/project/HaitiPixels.csv")
+
+haiti <- haiti %>%
+  clean_names() %>%  
+    rename(Class = class, Red = red, Green = green, Blue = blue) %>%
+      mutate(Class = factor(Class))
+```
+
+```{r}
+sum(is.na(haiti)) 
+haiti <- haiti %>% drop_na()
+```
+```{r}
+summary(haiti)
+
+str(haiti)
+```
+
+```{r}
+haiti_scaled <- haiti %>%
+  mutate(across(c(Red, Green, Blue), scale))
+```
+
+
+```{r}
+haiti_scaled %>%
+  count(Class) %>%
+  ggplot(aes(x = Class, y = n, fill = Class)) +
+  geom_col() +
+  labs(title = "Training Set Class Distribution", y = "Count") +
+  theme_minimal()
+
+
+haiti_scaled %>%
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Channel", values_to = "Value") %>%
+  ggplot(aes(x = Value, fill = Class)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~Channel, scales = "free") +
+  labs(title = "Distribution of RGB Values by Class") +
+  theme_minimal()
+```
+```{r}
+setwd("C:/Users/shriy/Documents/R files")
+```
+
+
+```{r}
+holdout_paths <- list.files("HoldOutData", pattern = "\\.txt$", full.names = TRUE)
+holdout_data <- tibble()
+```
+```{r}
+holdout_paths <- list.files("HoldOutData", pattern = "\\.txt$", full.names = TRUE)
+holdout_data <- tibble()
+
+
+options(readr.show_col_types = FALSE)
+
+for (file in holdout_paths) {
+  cat("\n Processing:", file, "\n")
+
+  tryCatch({
+    df <- suppressWarnings(
+      suppressMessages(
+        read_table(file, skip = 7, col_names = TRUE)
+      )
+    )
+
+    if (!all(c("B1", "B2", "B3") %in% names(df))) {
+      cat("❌X 1/B2/B3 columns not found — skipping.\n")
+      next
+    }
+    
+    
+    df_rgb <- df %>%
+      select(B1, B2, B3) %>%
+      rename(Red = B1, Green = B2, Blue = B3) %>%
+      mutate(across(everything(), as.numeric))
+
+    class_label <- case_when(
+      grepl("NON_Blue_Tarps", file, ignore.case = TRUE) ~ "NotBlueTarp",
+      grepl("Blue_Tarps", file, ignore.case = TRUE) ~ "BlueTarp",
+      TRUE ~ NA_character_
+    )
+
+    if (is.na(class_label)) {
+      cat("❌ Skipping: unable to determine class label\n")
+      next
+    }
+
+    df_rgb <- df_rgb %>%
+      mutate(Class = factor(class_label)) %>%
+      mutate(across(c(Red, Green, Blue), scale))
+
+    holdout_data <- bind_rows(holdout_data, df_rgb)
+    cat("✅ Loaded successfully\n")
+
+  }, error = function(e) {
+    cat("❌ ERROR in", file, ":", conditionMessage(e), "\n")
+  })
+}
+
+glimpse(holdout_data)
+table(holdout_data$Class)
+```
+
+
+```{r}
+unique(holdout_data$Class)
+summary(holdout_data)
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(holdout_data, aes(x = Class, fill = Class)) +
+  geom_bar() +
+  labs(title = "Class Distribution", x = "Tarp Type", y = "Count") +
+  scale_fill_manual(values = c("BlueTarp" = "blue", "NotBlueTarp" = "red")) +
+  theme_minimal()
+
+```
+
+```{r}
+# dlass distribution 
+holdout_data %>%
+  count(Class) %>%
+  mutate(Proportion = n / sum(n))
+```
+
+
+
+
+
