@@ -1,0 +1,581 @@
+---
+title:  |
+        | Disaster Relief Project
+        | Part One
+author: |
+        | Group 16
+        | Srivatsa Balasubramanyam 
+date: June 23, 2025
+output:
+  bookdown::html_document2:
+    number_sections: true
+    toc: false
+    extra_dependencies: ["float"]
+subtitle: |
+          | University of Virginia
+          | School of Data Science
+          | Statistical Learning
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, cache=TRUE, autodep=TRUE, fig.align="center")
+```
+
+### Load the required library
+
+```{r message=FALSE, warning=FALSE}
+rm(list=ls())
+library(tidymodels)
+library(tidyverse)
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+```
+
+```{r}
+#| cache: FALSE
+#| message: false
+library(doParallel)
+
+cl <- makePSOCKcluster(parallelly::availableCores(omit = 4))
+registerDoParallel(cl)
+```
+
+**Introduction**
+
+In the immediate aftermath of the January 12, 2010 earthquake in Haiti, nations worldwide responded to the Haitian government’s appeal for aid by pledging funds and dispatching rescue personnel. However, as rescue operations commenced, a critical challenge emerged: the destruction of communications infrastructure made it extremely difficult to determine where to direct emergency supplies and assistance.
+
+**Challenge: Locating Displaced Populations**
+
+With millions displaced and traditional communication channels inoperable, rescue workers needed an effective method to identify the locations of those most in need. It was observed that many displaced individuals were constructing makeshift shelters using blue tarps, which became a key visual indicator of temporary settlements
+
+A team from the Rochester Institute of Technology addressed this challenge by collecting high-resolution, geo-referenced aerial photographs over the affected areas. These images, while rich in detail, represented an enormous volume of data, making manual analysis infeasible given the urgency and scale of the crisis.
+
+**Solution: Statistical Modeling of Aerial Imagery**
+
+To overcome the limitations of manual image analysis, statistical modeling techniques were employed to automate the identification of makeshift shelters. The process involved:
+
+-   Using the color characteristics of blue tarps as the primary indicator of shelter locations.
+-   Extracting pixel-level data (Red, Green, Blue values) from the aerial images as predictor variables.
+-   Applying supervised learning algorithms to classify image regions as either containing blue tarps (shelters) or not.
+
+**Model Selection and Evaluation**
+
+Many statistical models will be considered for this task:
+
+Models without tuning parameters – Logistic Regression – LDA (Linear Discriminant Analysis) – QDA (Quadratic Discriminant Analysis)
+
+• Models with tuning parameters – KNN (K-nearest neighbor) – Penalized Logistic Regression (elastic net penalty) – Ensemble method: random forest (ranger) or boosting (XGBoost) – Support Vector Machines (SVM) ∗ linear kernel ∗ polynomial kernel ∗ radial basis function kernel
+
+#### Load the Haiti Dataset
+
+```{r message=FALSE, warning=FALSE}
+get_holdouts <- function(file) {
+  
+  infile <- read_lines(file,n_max = 20)
+  
+  col_row <- infile %>% 
+    data.frame() %>% 
+    mutate(text = gsub(';','',.)) %>% 
+    select(-.)%>% 
+    mutate(end = right(text,2) == 'B3',
+           row = row_number()) %>% 
+    filter(end==T) %>% 
+    select(row)
+  
+  f <- suppressWarnings(read_table(file,skip = col_row$row-1,n_max = 20,col_types = cols()))
+  
+  long_cols <- c('ID','X','Y','Map_X','Map_Y','Lat','Long','B1','B2','B3')
+  short_cols <- c('B1','B2','B3')
+  
+  if (ncol(f) > 4) {
+    final <- read_table(file,skip = col_row$row,col_names = long_cols,col_types = cols())
+  } else {
+    final <- read_table(file,skip = col_row$row,col_names = short_cols,col_types = cols())
+  }
+  
+}
+
+left <- function (x,n) substr(x,1,n)
+right <- function(x,n) substr(x,nchar(x)-n+1,nchar(x))
+
+
+training <- read_csv("https://gedeck.github.io/DS-6030/project/HaitiPixels.csv") %>% 
+  mutate(Class = factor(Class)) %>% 
+  mutate(Tarp = factor(ifelse(Class=='Blue Tarp','Tarp','Not Tarp'))) %>% 
+  mutate(Tarp = fct_relevel(Tarp,c('Tarp','Not Tarp')))
+
+setwd("C:/Users/shriy/Documents/R files")
+
+
+holdout <- data.frame(path = list.files("HoldOutData",recursive = T,pattern = '.txt',full.names = T)) %>% 
+  rowwise() %>% 
+  mutate(data = list(get_holdouts(path))) %>% 
+  ungroup()
+```
+
+```{r}
+str(training)
+str(holdout)
+```
+
+The dataset comprises nine files: one training set (63,241 observations) and eight holdout files. Each training observation corresponds to a pixel, with four variables: classification (Blue Tarp, Rooftop, Soil, Various Non-Tarp, Vegetation) and RGB values. A binary "Tarp"/"Not Tarp" column was added for focused analysis. The holdout set includes RGB values labeled as B1, B2, B3 and six coordinate columns. Initial exploration identified a duplicate file (orthovnir067_ROI_Blue_Tarps_data.txt), which was removed, resulting in a final holdout set exceeding 2,000,000 data points. Current efforts prioritize verifying RGB column correspondence across files to ensure data integrity for subsequent modeling.
+
+#### Check if any data is missing
+
+```{r}
+missing_count <- training %>%
+  summarise_all(~sum(is.na(.))) %>%
+  gather(key = "Variable", value = "Missing_Count") %>%
+  arrange(desc(Missing_Count))
+
+print(missing_count)
+```
+
+There is **No** missing data in any column in the given data set.
+
+#### The training data set
+
+```{r}
+summary(training)
+```
+
+### **Class Distribution indicates severe Imbalance in training dataset**
+
+-   **Blue Tarp**: 2,022 pixels (3.1%)
+
+-   **Non-Tarp Classes**: 63,219 pixels (96.9%)
+
+    -   Rooftop: 9,903 (15.2%)
+
+    -   Soil: 20,566 (31.5%)
+
+    -   Various Non-Tarp: 4,744 (7.3%)
+
+    -   Vegetation: 26,006 (39.8%)
+
+    **Key Issue**: Extreme class imbalance with tarps being only \~3% of data
+
+```{r}
+#| fig.width: 9
+#| fig.height: 4
+#| fig.cap: 'Classifications of the training set.'
+cols <- c('Blue Tarp' = 'deepskyblue3','Rooftop' = 'azure4','Soil'='chocolate4','Various Non-Tarp' = 'darkorange2','Vegetation'='darkolivegreen4')
+
+training %>% 
+  ggplot(aes(x=Tarp, fill = Class)) +
+  geom_bar(position = "stack")+
+  scale_fill_manual(values=cols)+
+  labs(title = "Classifications of the training set",
+       x = "Tarp Status")+
+  theme(plot.title = element_text(hjust = .5))
+```
+
+The chart clearly highlights the imbalance on different classes in the training data set.
+
+#### RGB Parameter analysis
+
+```{r}
+training_rgb <- training %>% 
+  select(Red,Green,Blue) %>% 
+  mutate(
+    RGB = rgb(Red, Green, Blue, maxColorValue = 255)
+  )
+```
+
+```{r}
+
+#| fig.width: 6
+#| fig.height: 3
+#| fig.cap: 'Histograms of RGB Values'
+
+df_long <- training_rgb %>%
+  select(Red,Green,Blue) %>% 
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Channel", values_to = "Value")
+
+# Create histograms for each channel
+ggplot(df_long, aes(x = Value, fill = Channel)) +
+  geom_histogram(binwidth = 5, alpha = 0.3, position = "identity") +
+  facet_wrap(~ Channel, scales = "free_y") +
+  labs(title = "Histograms of RGB Values", x = "Value", y = "Count") +
+  scale_fill_manual(values = c("blue", "green", "red")) +
+  theme_minimal()+
+  theme(plot.title = element_text(hjust = .5))
+```
+
+The RGB histogram analysis reveals a vegetation-heavy dataset with bimodal distributions across all channels, indicating diverse lighting conditions and surface types. Red values are heavily skewed low (typical of vegetated areas), while green and blue show distinct peaks. Overlapping distributions across all channels make simple RGB thresholding ineffective for blue tarp detection. Success will require band ratios, vegetation indices, and multi-band feature combinations rather than single-channel classification approaches.
+
+## The Holdout data set
+
+```{r}
+holdout_combo <- holdout %>% 
+  unnest(data) %>% 
+  na.omit()%>% 
+  mutate(b123 = rgb(B1,B2,B3,maxColorValue = 255),
+         b213 = rgb(B2,B1,B3,maxColorValue = 255),
+         b132 = rgb(B1,B3,B2,maxColorValue = 255),
+         b312 = rgb(B3,B1,B2,maxColorValue = 255),
+         b321 = rgb(B3,B2,B1,maxColorValue = 255),
+         b231 = rgb(B2,B3,B1,maxColorValue = 255)) %>% 
+  rename(lon=Long,lat=Lat) %>% 
+  select(path,lat,lon,B1,B2,B3,b123,b132,b213,b231,b321,b312) %>% 
+  nest(data = c(lat,lon,B1,B2,B3,b123,b132,b213,b231,b321,b312))
+
+all_holdout <- holdout_combo %>% 
+  select(data) %>% 
+  unnest(data) 
+```
+
+```{r}
+summary(all_holdout)
+```
+**-------------------------------------------------------------------------------------------------------------------------------------------**
+
+#### Exploratory Data Analysis on a Training Data Subset
+```{r}
+library(tidyverse)
+library(GGally)
+library(ggthemes)
+library(scales)
+library(gridExtra)
+library(knitr)
+library(ggplot2)
+```
+
+```{r}
+training %>%
+  count(Class) %>%
+  ggplot(aes(x = reorder(Class, -n), y = n, fill = Class)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = n), vjust = -0.5) +
+  labs(title = "Class Distribution in Training Set", x = "Class", y = "Pixel Count") +
+  theme_minimal()
+```
+
+* bar chart shows how many samples we have for each class in the training data
+* helps visualize if dataset is balanced or not
+* vegetation and soil have the highest counts (26,006 and 20,566)
+* blue tarp has only 2,022 points — *very underrepresented*
+* clear *class imbalance* in training set
+    * important because blue tarp is the class we care about most
+    * high risk of model predicting majority classes more often (soil, vegetation)
+    * need to apply class balancing techniques (oversampling, undersampling, etc.)
+    * accuracy alone won’t be enough of a metric due to the class imbalance --> *need precision, recall, and F1-score* especially for blue tarp detection
+
+
+
+```{r}
+training_long <- training %>%
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Channel", values_to = "Value")
+
+ggplot(training_long, aes(x = Value, fill = Class)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~ Channel, scales = "free") +
+  labs(title = "RGB Density Distributions by Class", x = "Pixel Value", y = "Density") +
+  theme_minimal()
+```
+* shows how each point's intensity (0–255) for RGB channels are distributed across each class
+* helps compare color profiles of different classes
+* blue tarp has *strong* peak in the blue channel around mid-range values, unlike other classes
+* vegetation and soil have higher green and red intensity ranges compared to blue tarp
+    * this makes sense (plants are generally gonna have more green than blue, etc.)
+* classes show overlapping but distinct density curves, especially for blue channel
+* supports idea that blue tarps can be distinguished based on RGB combos
+    * proves including raw RGB values in the model would be very informative/useful
+* could suggest *derived features (like blue-minus-red)* to further separate classes and to see if more patterns arise
+* but some RGB overlap between classes could cause classification errors
+
+
+
+
+```{r}
+training_long %>%
+  ggplot(aes(x = Channel, y = Value, fill = Class)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  labs(title = "RGB Boxplots by Class", x = "Channel", y = "Pixel Value") +
+  theme_minimal()
+```
+* shows pixel value range and spread across RGB channels for each class
+    * blue tarp has higher blue values and lower red/green medians --> matches what we expect
+    * vegetation shows low RGB values, especially in blue, most likely due to green --> matches what we expect
+    * soil and rooftop have overlapping distributions, could be harder to separate (brown is usually a mix of all three)
+    * various non-tarp shows wide spread in all channels, which could be a mix of materials/colors
+    * confirms blue tarp has a distinct color profile
+* supports using RGB values as features
+* useful to detect overlapping classes that might need more advanced features to separate
+
+
+
+
+```{r ggpairs-clean-final, fig.width=6, fig.height=6}
+ggpairs(training, columns = c("Red", "Green", "Blue"), mapping = aes(color = Class)) +
+  theme_bw()
+```
+
+- shows pairwise relationships between red, green, + blue pixel values by class  
+- above the diagonal shows correlation coefficients between each RGB pair  
+- below the diagonal shows scatterplots of RGB combinations colored by class  
+- diagonal shows density plots for each channel, split by class  
+    - blue tarp class has more spread in blue values, distinct from other classes  
+    - red and green values are highly correlated, especially for soil, rooftop, and vegetation  
+- most classes form clear linear patterns in scatterplots --> suggests RGB channels are not independent  
+- classes overlap, but blue tarp shows slightly different distribution in blue-green and blue-red  
+- useful to spot multicollinearity + see if certain combos might help with class separation  
+
+
+
+
+```{r}
+training <- training %>%
+  mutate(
+    BlueRatio = Blue / (Red + Green + Blue + 1),
+    GreenMinusRed = Green - Red,
+    BlueMinusRed = Blue - Red
+  )
+
+ggplot(training, aes(x = BlueRatio, fill = Class)) +
+  geom_density(alpha = 0.6) +
+  labs(title = "Blue Ratio Distribution by Class", x = "Blue Ratio", y = "Density") +
+  theme_minimal()
+```
+- shows distribution of a derived feature: blue ratio = blue / (red + green + blue + 1)  
+- helps compare how “blue-dominant” each class is relative to total pixel profile  
+    - blue tarp has much higher blue ratio values than all other classes - matches what we expect
+    - other classes cluster at lower blue ratio values  
+- useful feature for separating blue tarp from non-tarp classes  
+- derived feature simplifies RGB profile into one ratio/value
+- density curves show low overlap between blue tarp + other classes — good at discriminating between blue tarp or not?  
+
+
+
+#### Exploratory Data Analysis on a Test Data Subset
+
+```{r}
+all_holdout <- all_holdout %>%
+  rename(Red = B1, Green = B2, Blue = B3)  # adjust if your columns are named differently
+```
+
+
+
+```{r}
+all_holdout_long <- all_holdout %>%
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Channel", values_to = "Value")
+
+ggplot(all_holdout_long, aes(x = Value, fill = Channel)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  facet_wrap(~ Channel, scales = "free") +
+  labs(title = "Holdout RGB Histograms", x = "Pixel Value", y = "Frequency") +
+  theme_minimal()
+```
+- shows pixel value distributions in the holdout set  
+    - blue skews low, with many pixels in lower intensity range  
+    - green peaks in the mid-range, tails off gradually  
+    - red more evenly spread, slight peaks near 250 (could be because of overexposure/white areas)
+- validates that holdout data has similar lighting + color as training set  
+- important for ensuring model generalizes well, consistent color patterns
+- confirms preprocessing applied correctly --> RGB is within expected range (0–255)  
+
+
+
+
+```{r}
+ggplot(all_holdout_long, aes(x = Value, fill = Channel)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Channel, scales = "free") +
+  labs(title = "Holdout RGB Density", x = "Pixel Value", y = "Density") +
+  theme_minimal()
+```
+- shows smoothed density distribution of red, green, and blue pixel values in holdout set  
+- similar shape to histograms, but easier to see underlying trends and smooth peaks  
+- blue values concentrated in lower range — many dark blue/gray pixels  
+- green peaks around 120–150, likely from vegetation or green surfaces  
+- red is more evenly distributed, with small peaks across the full range  
+- confirms holdout set has similar structure to training set RGB-wise  
+- smooth curves make it easier to spot mode shifts or color balance issues  
+- no extreme color outliers — suggests preprocessing is consistent  
+- useful for sanity-checking color distributions before applying model  
+- helps visually compare holdout vs training distributions for RGB inputs  
+
+
+
+
+
+```{r}
+all_holdout <- all_holdout %>%
+  mutate(
+    BlueRatio = Blue / (Red + Green + Blue + 1),
+    GreenMinusRed = Green - Red,
+    BlueMinusRed = Blue - Red
+  )
+
+ggplot(all_holdout, aes(x = BlueRatio)) +
+  geom_density(fill = "blue", alpha = 0.6) +
+  labs(title = "Blue Ratio Distribution in Holdout Set", x = "Blue Ratio", y = "Density") +
+  theme_minimal()
+```
+
+- density plot showing distribution of BlueRatio in holdout (test) data  
+- BlueRatio = Blue / (Red + Green + Blue + 1) — emphasizes "blueness" in a pixel  
+- single, prominent peak around ~0.25 — most pixels not strongly blue-dominant  
+- smaller secondary bumps between 0.3–0.35 — may indicate some tarp or roof areas  
+- long right tail shows a few pixels with high blue dominance  
+- helps check if BlueRatio patterns in test set match training set  
+- no extreme outliers — BlueRatio remains bounded and stable  
+- important for generalizability — confirms that model inputs (like BlueRatio) behave similarly across both sets  
+- supports BlueRatio as a meaningful engineered feature for distinguishing classes (especially Blue Tarp)  
+
+
+
+
+#### Exploratory Data Analysis on a Both Data Sets
+
+```{r}
+train_rgb <- training %>%
+  select(Red, Green, Blue) %>%
+  mutate(Source = "Training")
+
+holdout_rgb <- all_holdout %>%
+  select(Red, Green, Blue) %>%
+  mutate(Source = "Holdout")
+
+combined_rgb <- bind_rows(train_rgb, holdout_rgb) %>%
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Channel", values_to = "Value")
+
+ggplot(combined_rgb, aes(x = Value, fill = Source)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Channel, scales = "free") +
+  labs(title = "RGB Distribution Comparison: Training vs. Holdout", x = "Pixel Value", y = "Density") +
+  theme_minimal()
+```
+
+- compares Red, Green, and Blue pixel value distributions across training and holdout sets  
+- helps check for dataset drift or mismatch in RGB characteristics  
+- Blue and Green channels show high overlap — distributions are similar  
+- Red channel shows some divergence — especially at extreme values near 255  
+- holdout has fewer high-red pixels compared to training set  
+- overall, good alignment across sets — suggests preprocessing preserved RGB balance  
+- confirms model trained on this training data is likely to generalize well on holdout data  
+- visual inspection step that validates ML assumption: training and test data come from same distribution  
+- worth noting slight differences for channels — might affect class balance (e.g., rooftop/soil detection)  
+
+
+
+
+
+```{r}
+train_features <- training %>%
+  select(BlueRatio, GreenMinusRed, BlueMinusRed) %>%
+  mutate(Source = "Training")
+
+holdout_features <- all_holdout %>%
+  select(BlueRatio, GreenMinusRed, BlueMinusRed) %>%
+  mutate(Source = "Holdout")
+
+combined_features <- bind_rows(train_features, holdout_features) %>%
+  pivot_longer(cols = c(BlueRatio, GreenMinusRed, BlueMinusRed), 
+               names_to = "Feature", values_to = "Value")
+
+ggplot(combined_features, aes(x = Value, fill = Source)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Feature, scales = "free") +
+  labs(title = "Derived Feature Distribution Comparison", 
+       x = "Value", y = "Density") +
+  theme_minimal()
+
+```
+
+- compares training vs. holdout distributions for engineered features: BlueMinusRed, BlueRatio, and GreenMinusRed  
+- verifies whether derived features behave similarly in both datasets — critical for model generalization  
+- BlueRatio shows strong alignment — reassuring since it's a key color-based signal for blue tarp detection  
+- BlueMinusRed and GreenMinusRed also largely match — slight spread differences but no major shift  
+- confirms derived features are stable across datasets  
+- supports our ML assumption that learned color ratios in training should work similarly on unseen data  
+- overall: good indication that these engineered features are reliable inputs for modeling  
+
+
+
+
+
+## Additional Visuals
+```{r}
+ggplot(training, aes(x = Red, y = Blue, color = Class)) +
+  geom_point(alpha = 0.4) +
+  labs(title = "Red vs Blue Color Space by Class") +
+  theme_minimal()
+
+ggplot(training, aes(x = Green, y = Blue, color = Class)) +
+  geom_point(alpha = 0.4) +
+  labs(title = "Green vs Blue Color Space by Class") +
+  theme_minimal()
+
+ggplot(training, aes(x = Red, y = Green, color = Class)) +
+  geom_point(alpha = 0.4) +
+  labs(title = "Red vs Green Color Space by Class") +
+  theme_minimal()
+
+```
+- Red vs Blue: clearly shows Blue Tarp pixels skew toward higher Blue values
+- Green vs Blue: Vegetation clusters lower in Blue
+- Red vs Green: Rooftop and Soil pixels mostly overlap, but Vegetation again shifts lower in Red
+- confirms multicollinearity exists (high RGB correlation), so derived features or PCA is probably needed
+
+
+
+```{r}
+library(corrplot)
+
+cor_matrix <- cor(training %>% 
+                    select(Red, Green, Blue, BlueRatio, GreenMinusRed, BlueMinusRed) %>% 
+                    na.omit())
+
+corrplot(cor_matrix, method = "color", addCoef.col = "black", tl.cex = 0.8)
+
+```
+- visualizes how strongly each feature is correlated with others using Pearson correlation
+- RGB are very highly correlated (>0.94) which is expected since they come from the same pixels
+- BlueRatio has low correlation with raw channels
+- GreenMinusRed + BlueMinusRed are negatively correlated with Red & Green, positively with Blue
+- BlueMinusRed + GreenMinusRed are strongly correlated with each other (0.77)
+- confirms BlueRatio + one color difference may be useful --> less redundant for modeling
+
+
+
+
+
+```{r}
+training %>%
+  pivot_longer(cols = c(Red, Green, Blue, BlueRatio, BlueMinusRed), names_to = "Feature", values_to = "Value") %>%
+  ggplot(aes(x = Class, y = Value, fill = Class)) +
+  geom_boxplot() +
+  facet_wrap(~ Feature, scales = "free", ncol = 2) +
+  labs(title = "Feature Distributions by Class") +
+  theme_minimal()
+
+```
+- shows distribution of each feature (RGB + derived) for every class 
+- BlueRatio + BlueMinusRed separates Blue Tarp from all other classes well 
+- Red and Green show broader spread and some class overlap 
+- Vegetation stands out in Red + Blue channels with low values which is expected
+- also useful to spot outliers and skewed distributions within each class
+
+
+
+
+```{r}
+train_pca <- prcomp(training[, c("Red", "Green", "Blue")], center = TRUE, scale. = TRUE)
+pca_df <- as_tibble(train_pca$x[, 1:2]) %>%
+  bind_cols(Class = training$Class)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Class)) +
+  geom_point(alpha = 0.4) +
+  labs(title = "PCA of RGB Features") +
+  theme_minimal()
+
+```
+- PCA reduces RGB data to 2D while preserving most variance
+- Blue Tarp + Vegetation form more distinct clusters
+- Soil, Rooftop, + Various Non-Tarp overlap more 
+
+
+
+
